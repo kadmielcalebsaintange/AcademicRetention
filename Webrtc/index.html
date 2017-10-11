@@ -1,0 +1,468 @@
+<!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML//EN">
+
+<!--
+Copyright (c) 2012 The WebRTC project authors. All Rights Reserved.
+
+Use of this source code is governed by a BSD-style license
+that can be found in the LICENSE file in the root of the source
+tree. An additional intellectual property rights grant can be found
+in the file PATENTS. All contributing project authors may
+be found in the AUTHORS file in the root of the source tree.
+-->
+
+<html>
+
+<head>
+<title>WebRTC Test</title>
+
+<style type="text/css">
+body, input, button, select, table {
+  font-family:"Lucida Grande", "Lucida Sans", Verdana, Arial, sans-serif;
+  font-size: 13 px;
+}
+body, input:enable, button:enable, select:enable, table {
+  color: rgb(51, 51, 51);
+}
+h1 {font-size: 40 px;}
+</style>
+
+
+<script src="http://172.16.154.246:8080/socket.io/socket.io.js"></script>
+<script type="text/javascript">
+
+// TODO: Catch more exceptions
+
+var server='http://172.16.154.246:8080';
+var myId = -1;
+var myName;
+var remoteId = -1;
+var remoteName;
+var request = null;
+var hangingGet = [];
+var pc = [];
+var localStream = null;
+var disconnecting = false;
+var callState = 0; // 0 - Not started, 1 - Call ongoing
+var autoCallTries = 0;
+var socket = io.connect(server);
+
+function getUserMedia() {
+  try {
+    navigator.webkitGetUserMedia({audio:true, video:true}, gotStream, gotStreamFailed);
+    console.log("Requested access to local media");
+  } catch (e) {
+    console.error(e, "getUserMedia error");
+  }
+}
+
+
+function setCallState(state) {
+  console.log("Changing call state: " + callState + " -> " + state);
+  callState = state;
+}
+
+// Local stream generation
+
+function gotStream(s) {
+  var url = webkitURL.createObjectURL(s);
+  document.getElementById("localView").src = url;
+  console.log("User has granted access to local media. url = " + url);
+  localStream = s;
+}
+
+function gotStreamFailed(error) {
+  alert("Failed to get access to local media. Error code was " + error.code +
+    ".");
+  console.warn("Failed to get access to local media. ", error);
+}
+
+
+
+// Peer list and remote peer handling
+
+function peerExists(id) {
+  try {
+    var peerList = document.getElementById("peers");
+    for (var i = 0; i < peerList.length; i++) {
+      if (parseInt(peerList.options[i].value, 10) == id)
+        return true;
+    }
+  } catch (e) {
+    console.error(e, "Error searching for peer");
+  }
+  return false;
+}
+
+
+function removePeer(id) {
+  try {
+    var peerList = document.getElementById("peers");
+    for (var i = 0; i < peerList.length; i++) {
+      if (parseInt(peerList.options[i].value) == id) {
+        peerList.remove(i);
+        break;
+      }
+    }
+  } catch (e) {
+    console.error(e, "Error removing peer");
+  }
+}
+
+function clearPeerList() {
+  var peerList = document.getElementById("peers");
+  while (peerList.length > 0)
+    peerList.remove(0);
+}
+
+function setSelectedPeer(id) {
+  try {
+    var peerList = document.getElementById("peers");
+    for (var i = 0; i < peerList.length; i++) {
+      if (parseInt(peerList.options[i].value) == id) {
+        peerList.options[i].selected = true;
+        return true;
+      }
+    }
+  } catch (e) {
+    console.error(e, "Error setting selected peer");
+  }
+  return false;
+}
+
+function getPeerName(id) {
+  try {
+    var peerList = document.getElementById("peers");
+    for (var i = 0; i < peerList.length; i++) {
+      if (parseInt(peerList.options[i].value) == id) {
+        return peerList.options[i].text;
+      }
+    }
+  } catch (e) {
+    console.error(e, "Error finding peer name");
+    return;
+  }
+  return;
+}
+
+function getPeerId(peer_name) {
+  try {
+    var peerList = document.getElementById("peers");
+    for (var i = 0; i < peerList.length; i++) {
+      if (peerList.options[i].text == peer_name) {
+        return parseInt(peerList.options[i].value);
+      }
+    }
+  } catch (e) {
+    console.error(e, "Error finding peer ID");
+    return -1;
+  }
+  return -1;
+}
+
+function storeRemoteInfo() {
+  try {
+    var peerList = document.getElementById("peers");
+    if (peerList.selectedIndex < 0) {
+      alert("Please select a peer.");
+      return false;
+    } else
+      remoteId = parseInt(peerList.options[peerList.selectedIndex].value);
+      remoteName = peerList.options[peerList.selectedIndex].text;
+  } catch (e) {
+    console.error(e, "Error storing remote peer info");
+    return false;
+  }
+  return true;
+}
+
+
+// Call control
+
+function createPeerConnection(peerId) {
+  if (pc[peerId]) {
+    console.warn("PeerConnection object already exists");
+  }
+  console.log("Creating PeerConnection object");
+  try {
+  
+	function onSignalingMessage(msg) {
+		console.log("Sending message to ID : " + peerId + "):\n" + msg);
+		sendToPeer(peerId, msg);
+	}  
+    pc[peerId] = new webkitDeprecatedPeerConnection("STUN stun.l.google.com:19302",
+      onSignalingMessage);
+	pc[peerId].onaddstream = onAddStream;
+	pc[peerId].onremovestream = onRemoveStream;
+  } catch (e) {
+    console.error(e, "Create PeerConnection error");
+  }
+}
+
+
+function doCall() {
+  if (!storeRemoteInfo())
+    return;
+  document.getElementById("call").disabled = false;
+  //document.getElementById("peers").disabled = true;
+  createPeerConnection(remoteId);
+  console.warn("PeerConnectionCreated by doCall()");
+  console.log("Adding stream");
+  pc[remoteId].addStream(localStream);
+  document.getElementById("hangup").disabled = false;
+  setCallState(1);
+}
+
+function hangUp(peerId) {
+  document.getElementById("hangup").disabled = true;
+  console.log("Sending BYE to " + peerId + " (ID " + peerId + ")");
+  sendToPeer(peerId, "BYE");
+  closeCall(peerId);
+}
+
+function closeCall(peerId) {
+  console.log("Stopping showing remote stream for Peer ID : "+peerId);
+  //window.location.reload();
+  if (pc[peerId]) {
+    console.log("Stopping call [pc.close()]");
+    pc[peerId].close();
+    pc[peerId] = null;
+  } else
+    console.log("No pc object to close");
+  remoteId = -1;
+  document.getElementById("call").disabled = false;
+  document.getElementById("peers").disabled = false;
+  setCallState(0);
+}
+
+// PeerConnection callbacks
+
+function onAddStream(e) {
+  var stream = e.stream;
+  var url = webkitURL.createObjectURL(stream);
+  var remoteVideoDiv = document.getElementById("remote");
+  remoteVideoDiv.innerHTML += '<video width="320" height="240" autoplay="autoplay"><source src="'+url+'"/></video>'
+  console.log("Started showing remote stream. url = " + url, e);
+}
+
+function onRemoveStream(e) {
+  // Currently if we get this callback, call has ended.
+  // document.getElementById("remoteView").src = "";
+  console.log("Stopped showing remote stream");
+}
+
+
+fetchUserlist = function(my_id, peers) {
+	myId = my_id;
+	console.log("My id: " + myId);
+	clearPeerList();
+	var added = 0;
+	for (var i = 0; i < peers.length; ++i) {
+	  if (peers[i].length > 0 && i!=myId) {		
+		console.log("Peer " + i + ": " + peers[i]);
+		addPeer(i, peers[i]);
+		++added;
+	  }
+	}
+	if (added == 0) {
+	  addPeer(-1, "No other peer connected");
+	  document.getElementById("peers").disabled = true;
+	}
+	else {
+	  document.getElementById("peers").disabled = false;
+	  document.getElementById("call").disabled = false;
+	}
+	document.getElementById("connect").disabled = true;
+	document.getElementById("disconnect").disabled = false;
+}
+
+function connect() {
+  myName = document.getElementById("name").value.toLowerCase();
+  server = document.getElementById("server").value.toLowerCase();
+  if (myName.length == 0) {
+    alert("I need a name please.");
+    document.getElementById("local").focus();
+  } else {
+    // TODO: Disable connect button here, but we need a timeout and check if we
+    // have connected, if so enable it again.
+    signIn();
+  }
+}
+
+
+socket.on('connect', function () {
+
+socket.on('error',function(error) {
+	alert(error);
+});
+
+// General
+addPeer = function (id, pname) {
+  try {
+	if(id == myId) return;
+    var peerList = document.getElementById("peers");
+    var option = document.createElement("option");
+    option.text = pname;
+    option.value = id;
+    peerList.add(option);
+  } catch (e) {
+    console.error(e, "Error adding peer");
+  }
+}
+
+socket.on('addPeer', function(my_id, userList) {
+	fetchUserlist(my_id, userList);
+});
+
+// TODO: Add callbacks onconnecting, onopen and onstatechange.
+
+
+// Server interaction
+
+socket.on('receiveMessage', function(remoteId, content) {
+	var peerName = getPeerName(remoteId);
+	if(!pc[remoteId]) {
+		if(!setSelectedPeer(remoteId)) {
+			console.warn("Received message from unknown peer, ignoring...");
+			return;
+		}
+		if(!confirm("You have a call coming in from "+peerName+". Accept Call?")) { 	// Reject Call
+			socket.emit('reject', myId, remoteId);
+			console.error("Call Rejected!");
+		}
+		if (!storeRemoteInfo())
+			return;
+		document.getElementById("call").disabled = false;
+		document.getElementById("peers").disabled = false;			  
+		createPeerConnection(remoteId);
+		console.warn("PeerConnectionCreated by handlePeerMessage()");
+		try {
+			pc[remoteId].processSignalingMessage(content);
+		}
+		catch(e) {
+			console.error(e, "Process signaling message error");
+		}
+		console.log("Adding Stream");
+		pc[remoteId].addStream(localStream);
+		document.getElementById("hangup").disabled = false;			
+	}
+	else {
+		if(content == 'REJECT') {
+			alert("The peer has rejected your call!");
+			console.log("The peer rejected the call");
+			document.getElementById("hangup").disabled = true;
+			closeCall(remoteid);
+			return;
+		}
+		try {			
+			pc[remoteId].processSignalingMessage(content);
+		} catch (e) {
+		console.error(e, "Process signaling message error");
+		}
+	}
+});
+
+sendToPeer = function(peer_id, data) {
+	socket.emit('sendMessage',myId, peer_id, data);
+}
+signIn = function() {
+	socket.emit('signIn', myName);
+	socket.on('ready', function(my_id, userList) {
+		fetchUserlist(my_id, userList);
+	});
+}
+
+function disconnect() {
+  if (callState == 1)
+    hangUp();
+  disconnecting = true;
+  clearPeerList();
+  addPeer(-1, "Not connected");
+  document.getElementById("connect").disabled = false;
+  document.getElementById("disconnect").disabled = true;
+  document.getElementById("peers").disabled = true;
+  document.getElementById("call").disabled = true;
+
+  disconnecting = false;
+}
+
+});
+
+// Window event handling
+window.onload = function() {
+  if (navigator.webkitGetUserMedia) {
+    document.getElementById('testApp').hidden = false;
+	getUserMedia();
+
+  } else {
+    document.getElementById('errorText').hidden = false;
+  }
+}
+
+
+
+//window.onbeforeunload = disconnect();
+
+</script>
+</head>
+
+<body>
+<h1>WebRTC</h1>
+<section id="errorText" hidden="true">
+Could not detect WebRTC support.<p>
+You must have WebRTC enabled Chrome browser to use this test page. The browser
+must be started with the --enable-media-stream command line flag. For more
+information, please see
+<a href="https://sites.google.com/site/webrtc/blog/webrtcnowavailableinthechromedevchannel">
+this blog post</a>.
+</section>
+
+<section id="testApp" hidden="true">
+Local Preview :
+<video width="320" height="240" id="localView" autoplay="autoplay"></video>
+<div id="remote">
+
+</div>
+
+<table border="0">
+<tr>
+ <td valign="top">
+  <table border="0" cellpaddning="0" cellspacing="0">
+  <tr>
+   <td>Server:</td>
+   <td>
+    <input type="text" id="server" size="30" value="http://172.16.154.246:8080"/>
+   </td>
+  </tr>
+  <tr>
+   <td>Name:</td><td><input type="text" id="name" size="30" value="name"/></td>
+  </tr>
+  </table>
+ </td>
+ <td valign="top">
+  <button id="connect" onclick="connect();">Connect</button><br>
+  <button id="disconnect" onclick="disconnect();" disabled="true">Disconnect
+  </button>
+ </td>
+ <td>&nbsp;&nbsp;&nbsp;</td>
+ <td valign="top">
+  Connected peers:<br>
+  <select id="peers" size="5" disabled="true">
+   <option value="-1">Not connected</option>
+  </select>
+  </td>
+ <td valign="top">
+  <!--input type="text" id="peer_id" size="3" value="1"/><br-->
+  <button id="call" onclick="doCall();" disabled="true">Call</button><br>
+  <button id="hangup" onclick="hangUp();" disabled="true">Hang up</button><br>
+ </td>
+</tr>
+</table>
+
+<button onclick="document.getElementById('debug').innerHTML='';">Clear log
+</button>
+<pre id="debug"></pre>
+</section>
+
+</body>
+
+</html>
